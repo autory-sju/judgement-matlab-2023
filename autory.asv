@@ -9,6 +9,7 @@ pp.LookaheadDistance=3; % m
 pp.DesiredLinearVelocity=3; % m/s
 pp.MaxAngularVelocity = 2.0; % rad/s
 yaw = [0;0];
+modelStatesSub = rossubscriber('/gazebo/model_states');
 gpsSub = rossubscriber('/young_ho');
 speedSub = rossubscriber('arduino_speed_out');
 
@@ -127,12 +128,9 @@ function isStop = redConeBrake(redCones)
         % for every red cones detected
         for i=1:1:size(redCones,1)
             % distance between one of red cone is under 5meter
-            if redCones(i,0)<5
+            if norm(redCones(i,:)) < 6
                 redConeCnt = redConeCnt+1;
             end
-            % if norm(redCones(i,:)) < 6
-            %     redConeCnt = redConeCnt+1;
-            % end
         end
         if redConeCnt>2
             isStop = 1;
@@ -140,6 +138,27 @@ function isStop = redConeBrake(redCones)
     end
 end
 
+function conePosition = extractConePositions(cuboidTreshold, coneBboxesLidar_l, coneBboxesLidar_r)
+    % Extract xlen, ylen, zlen from the bounding boxes
+    volumes_l = prod(coneBboxesLidar_l(:, 4:6), 2);
+    volumes_r = prod(coneBboxesLidar_r(:, 4:6), 2);
+
+    % Find indices where volumes are smaller than cuboidThreshold
+    indices_l = volumes_l > cuboidTreshold;
+    indices_r = volumes_r > cuboidTreshold;
+
+    % Combine the inner cone positions from left and right into a single array
+    conePosition = [coneBboxesLidar_l(indices_l, 1:2);coneBboxesLidar_r(indices_r, 1:2)];
+end
+
+function [y_coneBboxesLidar, b_coneBboxesLidar] = splitConesBboxes(y_coneBboxs,bboxesLidar,boxesUsed)
+    % y_cone의 개수만 계산
+    numY_cone = sum(boxesUsed(1:size(y_coneBboxs,1)));
+    
+    % bboxesLidar에서 y_cone와 b_cone의 bbox 분류
+    y_coneBboxesLidar = bboxesLidar(1:numY_cone, :);
+    b_coneBboxesLidar = bboxesLidar(numY_cone+1:end, :);
+end
 
 
 
@@ -164,9 +183,124 @@ function odomWaypoints = transformWaypointsToOdom(waypoints, vehiclePoseInOdom)
     end
 end
 
+function [y_coneBboxs, b_coneBboxs] = extractConesBboxs(bboxData)
+    % BoundingBoxes_ 대신 Detections의 길이로 메모리 공간을 미리 할당
+    numBboxes = numel(bboxData.Detections);
+
+    % y_cone 및 b_cone에 대한 임시 저장 공간
+    temp_y_coneBboxs = zeros(numBboxes, 4);
+    temp_b_coneBboxs = zeros(numBboxes, 4);
+
+    y_count = 0;
+    b_count = 0;
+
+    for i = 1:numBboxes
+        currentBbox = bboxData.Detections(i, 1).Mask.Roi;
+        
+        % 변경된 데이터 형식에 따라 BoundingBoxes_ 대신 Mask.Roi 사용
+        x = currentBbox.X;
+        y = currentBbox.Y;
+        w = currentBbox.Width;
+        h = currentBbox.Height;
+        
+        if strcmp(bboxData.Detections(i, 1).Label, 'y_cone')
+            y_count = y_count + 1;
+            temp_y_coneBboxs(y_count, :) = [x, y, w, h];
+        else
+            b_count = b_count + 1;
+            temp_b_coneBboxs(b_count, :) = [x, y, w, h];
+        end
+    end
+
+    % 최종 결과
+    y_coneBboxs = temp_y_coneBboxs(1:y_count, :);
+    b_coneBboxs = temp_b_coneBboxs(1:b_count, :);
+end
+
+function vehiclePose = getVehiclePose(tree, sourceFrame, targetFrame)
+    % This function returns the pose of the vehicle in the odom frame.
+
+    % Check if the frames are available in the tree
+    if ~any(strcmp(tree.AvailableFrames, sourceFrame))
+        error('Source frame is not available in the tree');
+    end
+    if ~any(strcmp(tree.AvailableFrames, targetFrame))
+        error('Target frame is not available in the tree');
+    end
+
+    % Wait for the transformation to be available
+    waitForTransform(tree, sourceFrame, targetFrame); 
+
+    % Get the transformation
+    tf = getTransform(tree, sourceFrame, targetFrame);
+
+    % Extract the vehicle's pose
+    trans = [tf.Transform.Translation.X;
+             tf.Transform.Translation.Y];
+
+    quat = [tf.Transform.Rotation.W;
+            tf.Transform.Rotation.X;
+            tf.Transform.Rotation.Y;
+            tf.Transform.Rotation.Z];
+
+    eul = quat2eul(quat');  % Get the euler angles in ZYX order (yaw, pitch, roll)
+
+    vehiclePose = [trans; eul(1)];  % Vehicle's pose in [x, y, theta(yaw)]
+end
 
 
 
+
+function roiPtCloud = preprocess_lidar_data(lidarData, params, roi)
+    xyzData = rosReadXYZ(lidarData);
+    ptCloud = pointCloud(xyzData);
+
+    ptCloudOrg = pcorganize(ptCloud, params);
+
+    groundPtsIdx = segmentGroundFromLidarData(ptCloudOrg);
+    nonGroundPtCloud = select(ptCloudOrg, ~groundPtsIdx, 'OutputSize', 'full');
+
+    indices = findPointsInROI(nonGroundPtCloud, roi);
+    roiPtCloud = select(nonGroundPtCloud, indices);
+
+    roiPtCloud = pcdenoise(roiPtCloud, 'PreserveStructure', true);
+end
+
+function [centers, innerConePosition, outerConePosition] = process_clusters(roiPtCloud)
+    [labels, numClusters] = pcsegdist(roiPtCloud, 0.3);
+
+    xData = roiPtCloud.Location(:,1);
+    yData = roiPtCloud.Location(:,2);
+
+    clf;
+    hold on;
+    centers = [];
+    innerConePosition = [];
+    outerConePosition = [];
+    for i = 1:numClusters
+        idx = labels == i;
+        clusterPoints = [xData(idx), yData(idx), roiPtCloud.Location(idx,3)];
+
+        if size(clusterPoints, 1) >= 20
+            [~, maxZIdx] = max(clusterPoints(:,3));
+            center = clusterPoints(maxZIdx, 1:2);
+            centers = [centers; center];
+
+            if center(2)<0
+                innerConePosition=[innerConePosition; center(1), center(2)];
+            else
+                outerConePosition=[outerConePosition; center(1), center(2)];
+            end
+            scatter(center(1), -center(2), "red","filled");
+        end
+    end
+end
+
+function uniqueArray = unique_rows(array)
+    [~, uniqueIdx] = unique(array, 'rows');
+    uniqueArray = array(uniqueIdx, :);
+    uniqueArray = sortrows(uniqueArray);
+end
 
 function [out1, out2] = match_array_lengths(arr1, arr2)
     len1 = size(arr1, 1); % Get the number of rows
@@ -250,40 +384,40 @@ function waypoints = generate_waypoints_del(innerConePosition, outerConePosition
 		    %step 5 : 최종 waypoint 생성
     %waypoints=[xp', yp'];
 end
-% 
-% function waypoints = generate_waypoints(innerConePosition, outerConePosition)
-% 	%go_traingulation
-% 
-%     [m,nc] = size(innerConePosition); % size of the inner/outer cone positions data
-%     kockle_coords = zeros(2*m,nc); % initiate a P matrix consisting of inner and outer coordinates
-%     kockle_coords(1:2:2*m,:) = innerConePosition;
-%     kockle_coords(2:2:2*m,:) = outerConePosition;
-%     xp=[];
-%     yp=[];
-% 
-%     midpoints=zeros(size(kockle_coords, 1)-1 , size(kockle_coords,2));
-% 
-%     for i=1:size(kockle_coords, 1) -1
-%         midpoints(i,1)=(kockle_coords(i,1)+kockle_coords(i+1,1)) /2;
-%         midpoints(i,2)=(kockle_coords(i,2)+kockle_coords(i+1,2)) /2;
-%     end
-%     waypoints = midpoints;
-% 
-%     % distancematrix = squareform(pdist(midpoints));
-%     % distancesteps = zeros(length(midpoints)-1,1);
-%     % for j = 2:length(midpoints)
-%     %     distancesteps(j-1,1) = distancematrix(j,j-1);
-%     % end
-%     % totalDistance = sum(distancesteps); % total distance travelled
-%     % distbp = cumsum([0; distancesteps]); % distance for each waypoint
-%     % gradbp = linspace(0,totalDistance,100);
-%     % xq = interp1(distbp,midpoints(:,1),gradbp,'spline'); % interpolate x coordinates
-%     % yq = interp1(distbp,midpoints(:,2),gradbp,'spline'); % interpolate y coordinates
-%     % xp = [xp xq]; % store obtained x midpoints after each iteration
-%     % yp = [yp yq]; % store obtained y midpoints after each iteration
-%     % 
-%     % waypoints=[xp', yp'];
-% end
+
+function waypoints = generate_waypoints(innerConePosition, outerConePosition)
+	%go_traingulation
+    
+    [m,nc] = size(innerConePosition); % size of the inner/outer cone positions data
+    kockle_coords = zeros(2*m,nc); % initiate a P matrix consisting of inner and outer coordinates
+    kockle_coords(1:2:2*m,:) = innerConePosition;
+    kockle_coords(2:2:2*m,:) = outerConePosition;
+    xp=[];
+    yp=[];
+
+    midpoints=zeros(size(kockle_coords, 1)-1 , size(kockle_coords,2));
+
+    for i=1:size(kockle_coords, 1) -1
+        midpoints(i,1)=(kockle_coords(i,1)+kockle_coords(i+1,1)) /2;
+        midpoints(i,2)=(kockle_coords(i,2)+kockle_coords(i+1,2)) /2;
+    end
+    waypoints = midpoints;
+    
+    % distancematrix = squareform(pdist(midpoints));
+    % distancesteps = zeros(length(midpoints)-1,1);
+    % for j = 2:length(midpoints)
+    %     distancesteps(j-1,1) = distancematrix(j,j-1);
+    % end
+    % totalDistance = sum(distancesteps); % total distance travelled
+    % distbp = cumsum([0; distancesteps]); % distance for each waypoint
+    % gradbp = linspace(0,totalDistance,100);
+    % xq = interp1(distbp,midpoints(:,1),gradbp,'spline'); % interpolate x coordinates
+    % yq = interp1(distbp,midpoints(:,2),gradbp,'spline'); % interpolate y coordinates
+    % xp = [xp xq]; % store obtained x midpoints after each iteration
+    % yp = [yp yq]; % store obtained y midpoints after each iteration
+    % 
+    % waypoints=[xp', yp'];
+end
 
 
 
