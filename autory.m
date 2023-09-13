@@ -5,34 +5,40 @@ tftree = rostf;
 pause(3);
 
 pp=controllerPurePursuit;
-pp.LookaheadDistance=1.3; % m
-pp.DesiredLinearVelocity=1.5; % m/s
+pp.LookaheadDistance=3; % m
+pp.DesiredLinearVelocity=3; % m/s
 pp.MaxAngularVelocity = 2.0; % rad/s
-
+yaw = [0;0];
 modelStatesSub = rossubscriber('/gazebo/model_states');
-gpsSub = rossubscriber('');
+gpsSub = rossubscriber('/young_ho');
 speedSub = rossubscriber('arduino_speed_out');
 
 waypoints = [];
-markerIdPath = 0;
-
+% tic;
 
 while true
-    currentVelo= receive(speedSub);
+    currentVelo = receive(speedSub);
+    currentPosUtm = receive(gpsSub);
 
-    tic;
+    vehiclePose = updateVehiclePose(currentPosUtm, curPos, currentVelo, yaw); %수정 필요 
 
-    vehiclePose = updateVehiclePose(modelStatesSub, tftree); %수정 필요 
+    % gpsVelocity = norm(vehiclePose(1:2)- curPos)/toc; % m/s by GPS
+    curPos = vehiclePose(1:2);
+    curYaw = vehiclePose(3);
+
+    % curPos = pos;
+
+    % tic;
 
     if isempty(pp.Waypoints) || norm(worldWaypoints(end,:)-[vehiclePose(1), vehiclePose(2)]) < waypointTreshold  % Considering only x and y for the distance
         disp("Make new waypoints");
-        
-        try
 
+        try
    
             %innerConePosition = unique_rows(innerConePosition); %필요하면 주석 빼
             %outerConePosition = unique_rows(outerConePosition);
 
+            % For watching Cone perception
             hold off;
             scatter(innerConePosition(:,1),innerConePosition(:,2),'blue');
             hold on;
@@ -43,13 +49,6 @@ while true
 
             worldWaypoints = transformWaypointsToOdom(waypoints, vehiclePose);
             
-
-            [markerArrayMsg, markerIdClusters] = generate_clusters_marker(innerConePosition, outerConePosition, 'base_footprint', markerIdClusters);
-            send(pubClusters, markerArrayMsg);
-
-            [pathMarkerMsg, markerIdPath] = generate_path_marker(worldWaypoints, 'hunter2_base', markerIdPath);
-            send(pubPath, pathMarkerMsg);
-     
             pp.Waypoints = worldWaypoints;
         catch
             disp("Fail to make new waypoints");
@@ -71,23 +70,31 @@ while true
     [v, w] = pp(vehiclePose);  % Pass the current vehicle pose to the path planner
     [pub, msg] = publish_twist_command(v, w, '/ackermann_steering_controller/cmd_vel');
     send(pub, msg);
-    toc;
+
+    % 종방향 속도, 횡방향 각속도
+    tractive_controll = v;
+    steering_control = w;
 
 end
 
 
-function vehiclePose = updateVehiclePose(modelStatesSub, tftree)
+function vehiclePose = updateVehiclePose(currentPosUtm,prevPosUtm, curVelo,yaw)
     %vehiclePoseOdom = getVehiclePose(tftree, 'ackermann_steering_controller/odom', 'base_footprint');
     %vehiclePose = vehiclePoseOdom;
 
-    modelStatesMsg = receive(modelStatesSub);
-    robotIndex = find(strcmp(modelStatesMsg.Name, 'hunter2_base'));  
-    robotPose = modelStatesMsg.Pose(robotIndex);
-    quat = [robotPose.Orientation.W, robotPose.Orientation.X, robotPose.Orientation.Y, robotPose.Orientation.Z]; % we need change this to our car
-    euler = quat2eul(quat);
-    yaw = euler(1);
-    vehiclePoseGT=[robotPose.Position.X; robotPose.Position.Y; yaw];
 
+    if curVelo > 3
+        yaw = currentPosUtm-prevPosUtm;
+    end
+
+    % modelStatesMsg = receive(modelStatesSub);
+    % robotIndex = find(strcmp(modelStatesMsg.Name, 'hunter2_base'));  
+    % robotPose = modelStatesMsg.Pose(robotIndex);
+    % quat = [robotPose.Orientation.W, robotPose.Orientation.X, robotPose.Orientation.Y, robotPose.Orientation.Z]; % we need change this to our car
+    % euler = quat2eul(quat);
+    % yaw = euler(1);
+    % vehiclePoseGT=[robotPose.Position.X; robotPose.Position.Y; yaw];
+    vehiclePoseGT=[currentPosUtm(1),currentPosUtm(2),yaw];
     % TF 메시지 생성 및 설정
     %tfStampedMsg = rosmessage('geometry_msgs/TransformStamped');
     %tfStampedMsg.ChildFrameId = 'base_link';
@@ -387,63 +394,8 @@ function waypoints = generate_waypoints(innerConePosition, outerConePosition)
     % waypoints=[xp', yp'];
 end
 
-function [markerArrayMsg, markerID] = generate_clusters_marker(b_coneCluster, y_coneCluster, frameId, markerID)
-    % Concatenate the clusters for easier looping
-    combinedClusters = [b_coneCluster; y_coneCluster];
-    clusterColors = [repmat([0 0 1], size(b_coneCluster, 1), 1); % Blue for b_coneCluster
-                     repmat([1 1 0], size(y_coneCluster, 1), 1)]; % Yellow for y_coneCluster
-
-    markerArrayMsg = rosmessage('visualization_msgs/MarkerArray','DataFormat','struct');
-    
-    for i = 1:height(combinedClusters)
-        markerMsg = rosmessage('visualization_msgs/Marker','DataFormat','struct');
-        markerMsg.Header.FrameId = frameId;
-        markerMsg.Id = int32(markerID); % Cast 'markerID' to int32
-        markerID = markerID + 1;  % Increment markerID by 1 for each new marker
-        markerMsg.Type = int32(3);
-        markerMsg.Action = int32(0);
-        markerMsg.Pose.Position.X = double(combinedClusters(i,1));
-        markerMsg.Pose.Position.Y = double(combinedClusters(i,2));
-        markerMsg.Pose.Position.Z = 0;
-        markerMsg.Pose.Orientation.W = 1.0;
-        markerMsg.Scale.X = 0.3;
-        markerMsg.Scale.Y = 0.3;
-        markerMsg.Scale.Z = 0.5;
-        
-        % Set Color
-        markerMsg.Color.R = single(clusterColors(i, 1));
-        markerMsg.Color.G = single(clusterColors(i, 2));
-        markerMsg.Color.B = single(clusterColors(i, 3));
-        markerMsg.Color.A = single(0.5);
-        
-        markerArrayMsg.Markers(i) = markerMsg;
-    end
-end
 
 
-function [markerMsg, markerID] = generate_path_marker(waypoints, frameId, markerID)
-    markerMsg = rosmessage('visualization_msgs/Marker','DataFormat','struct');
-    markerMsg.Header.FrameId = frameId;
-    markerMsg.Id = int32(markerID);  % Cast 'markerID' to int32
-    markerID = markerID + 1;  % Increment markerID by 1 for each new marker
-    markerMsg.Type = int32(4); % LINE_STRIP
-    markerMsg.Action = int32(0);
-    markerMsg.Pose.Orientation.W = 1.0;
-    markerMsg.Scale.X = 0.05;  % Specify a suitable scale
-    markerMsg.Color.R = single(1.0); % red
-    markerMsg.Color.G = single(0.0); % green
-    markerMsg.Color.B = single(0.0); % blue
-    markerMsg.Color.A = single(1.0); % alpha
-
-    % Add the waypoints to the points array of the marker
-    for i = 1:size(waypoints, 1)
-        point = rosmessage('geometry_msgs/Point','DataFormat','struct');
-        point.X = double(waypoints(i, 1));
-        point.Y = double(waypoints(i, 2));
-        point.Z = 0;
-        markerMsg.Points(i) = point;
-    end
-end
 
 
 
